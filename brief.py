@@ -95,14 +95,18 @@ def regime_classifier(prior_close, atr_points, vix, vix3m, px_close):
     return label, size, term, atr_pct, slope_pct_per_day, drivers
 
 def filter_targets(pivot, candidates, band, direction):
-    if pivot is None or band is None: return []
-    x = [v for v in (candidates or []) if v is not None]
+    """Keep only levels within ±band of pivot and on the requested side."""
+    p = fnum(pivot)
+    b = fnum(band)
+    if p is None or b is None or b <= 0:
+        return []
+    x = fnum_list(candidates)
     if direction == "above":
-        keep = [v for v in x if pivot < v <= pivot + band]
-        return sorted(keep)
+        keep = [v for v in x if p < v <= p + b]
+        return sorted(set(keep))
     else:
-        keep = [v for v in x if pivot - band <= v < pivot]
-        return sorted(keep, reverse=True)
+        keep = [v for v in x if p - b <= v < p]
+        return sorted(set(keep), reverse=True)
 
 def extract_pivots(entry):
     """Supports DUP/DDP/WUP/WDP + legacy r/s keys; coerces everything to floats."""
