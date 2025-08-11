@@ -1,6 +1,11 @@
-# brief.py — v5
+# brief.py — v6
 # Morning Daily Brief to Discord (7:30am ET)
-# Adds: Macro Calendar block + Playbook Cue (SPX options / NQ futures)
+# - Daily/Weekly bands use options-implied Expected Move (EM) instead of ADR/ATR.
+# - EM(SPX) from VIX; EM(NQ) from VXN. EM(days) = Price * IV_annual * sqrt(days/252).
+# - Daily targets filtered around DUP/DDP with ±(EM_1D * day_atr_mult).
+# - Weekly targets filtered around WUP/WDP with ±(EM_5D * week_atr_mult).
+# - Keeps detailed Regime + Playbook cues, Macro block, SPX/NQ sections.
+
 import os, math, traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -11,8 +16,22 @@ import pandas as pd
 import yfinance as yf
 import yaml
 
+ET = ZoneInfo("America/New_York")
+WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
+if not WEBHOOK:
+    print("❌ DISCORD_WEBHOOK_URL is missing.")
+    raise SystemExit(2)
+
+# ---------- helpers ----------
+def pct(a, b):
+    if a is None or b is None or b == 0: return None
+    return 100.0 * (a / b - 1.0)
+
+def fmt(x, n=2):
+    return "na" if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))) else f"{x:.{n}f}"
+
 def fnum(x):
-    """Robust float coercion: handles strings like '17,650', ' na ', None."""
+    """Robust float coercion for YAML: handles '17,650', ' na ', None."""
     try:
         if x is None:
             return None
@@ -32,21 +51,8 @@ def fnum_list(xs):
             out.append(fv)
     return out
 
-ET = ZoneInfo("America/New_York")
-WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
-if not WEBHOOK:
-    print("❌ DISCORD_WEBHOOK_URL is missing.")
-    raise SystemExit(2)
-
-# ---------- helpers ----------
-def pct(a, b):
-    if a is None or b is None or b == 0: return None
-    return 100.0 * (a / b - 1.0)
-
-def fmt(x, n=2):
-    return "na" if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))) else f"{x:.{n}f}"
-
 def calc_atr14(df):
+    """Still compute full-session ATR14 for reference text (not used for bands)."""
     if df is None or df.empty or len(df) < 15: return None
     h,l,c = df["High"], df["Low"], df["Close"]
     pc = c.shift(1)
@@ -54,7 +60,7 @@ def calc_atr14(df):
     return float(tr.rolling(14).mean().iloc[-1])
 
 def iv30_and_skew_proxy(prior_close):
-    # Best-effort: SPY options; fallback to VIX.
+    """For the global snapshot (SPX-ish), try SPY options; fallback to VIX."""
     try:
         spy = yf.Ticker("SPY")
         opts = spy.options
@@ -94,6 +100,35 @@ def regime_classifier(prior_close, atr_points, vix, vix3m, px_close):
         drivers = ["neutral mix"]
     return label, size, term, atr_pct, slope_pct_per_day, drivers
 
+def expected_move(price, iv_annual, days):
+    """EM in points for 'days' trading days."""
+    p = fnum(price); iv = fnum(iv_annual)
+    if p is None or iv is None: return None
+    return p * iv * math.sqrt(days / 252.0)
+
+def iv_proxy_for_symbol(name):
+    """
+    IV proxy (annualized) per symbol for EM:
+      SPX -> VIX
+      NQ  -> VXN (fallback to VIX if N/A)
+    Returns float in decimals (e.g., 0.18) or None.
+    """
+    try:
+        if name == "SPX":
+            h = yf.Ticker("^VIX").history(period="2d", interval="1d")
+            return None if h.empty else float(h["Close"].iloc[-1]) / 100.0
+        elif name == "NQ":
+            hvxn = yf.Ticker("^VXN").history(period="2d", interval="1d")
+            if not hvxn.empty:
+                return float(hvxn["Close"].iloc[-1]) / 100.0
+            # fallback to VIX if VXN missing
+            hvix = yf.Ticker("^VIX").history(period="2d", interval="1d")
+            return None if hvix.empty else float(hvix["Close"].iloc[-1]) / 100.0
+        else:
+            return None
+    except Exception:
+        return None
+
 def filter_targets(pivot, candidates, band, direction):
     """Keep only levels within ±band of pivot and on the requested side."""
     p = fnum(pivot)
@@ -109,7 +144,7 @@ def filter_targets(pivot, candidates, band, direction):
         return sorted(set(keep), reverse=True)
 
 def extract_pivots(entry):
-    """Supports DUP/DDP/WUP/WDP + legacy r/s keys; coerces everything to floats."""
+    """Supports DUP/DDP/WUP/WDP + legacy r/s keys; coerces to floats."""
     if not entry:
         return None, None, None, None, [], []
     dup = fnum(entry.get("dup"))
@@ -118,22 +153,19 @@ def extract_pivots(entry):
     wdp = fnum(entry.get("wdp"))
     above = fnum_list(entry.get("above", []))
     below = fnum_list(entry.get("below", []))
-    # legacy extras
-    for k in ("r1", "r2", "r3"):
+    for k in ("r1","r2","r3"):
         fv = fnum(entry.get(k))
-        if fv is not None:
-            above.append(fv)
-    for k in ("s1", "s2", "s3"):
+        if fv is not None: above.append(fv)
+    for k in ("s1","s2","s3"):
         fv = fnum(entry.get(k))
-        if fv is not None:
-            below.append(fv)
+        if fv is not None: below.append(fv)
     return dup, ddp, wup, wdp, above, below
 
 # ---------- per-symbol block ----------
 def build_symbol_block(name, cfg, today):
     ticker = cfg.get("ticker", "ES=F" if name=="SPX" else "NQ=F")
-    day_mult  = float(cfg.get("day_atr_mult", 1.0))
-    week_mult = float(cfg.get("week_atr_mult", 1.0))
+    day_mult  = float(cfg.get("day_atr_mult", 1.0))   # now EM multiplier
+    week_mult = float(cfg.get("week_atr_mult", 1.0))  # now EM multiplier
 
     t = yf.Ticker(ticker)
     daily = t.history(period="90d", interval="1d", auto_adjust=False)
@@ -146,10 +178,17 @@ def build_symbol_block(name, cfg, today):
     o_low  = float(pm["Low"].min()) if not pm.empty else prior_low
     o_high = float(pm["High"].max()) if not pm.empty else prior_high
 
+    # reference ATRs just for display sanity (not used for bands)
     atr = calc_atr14(daily)
     week = t.history(period="400d", interval="1wk", auto_adjust=False)
     watr = calc_atr14(week)
 
+    # IV proxy -> EM
+    iv_annual = iv_proxy_for_symbol(name)  # 0.XX
+    em_1d = expected_move(prior_close, iv_annual, 1)
+    em_5d = expected_move(prior_close, iv_annual, 5)
+
+    # pivots from YAML
     d_key = today.strftime("%Y-%m-%d")
     w_key = f"{today.isocalendar().year}-W{int(today.isocalendar().week):02d}"
     d_ent = (cfg.get("daily") or {}).get(d_key, {})
@@ -158,34 +197,36 @@ def build_symbol_block(name, cfg, today):
     dup, ddp, _, _, d_above_raw, d_below_raw = extract_pivots(d_ent)
     _,   _, wup, wdp, w_above_raw, w_below_raw = extract_pivots(w_ent)
 
-    d_above = filter_targets(dup, d_above_raw, (atr or 0)*day_mult, "above") if dup is not None else []
-    d_below = filter_targets(ddp, d_below_raw, (atr or 0)*day_mult, "below") if ddp is not None else []
-    w_above = filter_targets(wup, w_above_raw, (watr or 0)*week_mult, "above") if wup is not None else []
-    w_below = filter_targets(wdp, w_below_raw, (watr or 0)*week_mult, "below") if wdp is not None else []
+    # filter to EM bands
+    d_band = (em_1d or 0) * day_mult
+    w_band = (em_5d or 0) * week_mult
+    d_above = filter_targets(dup, d_above_raw, d_band, "above") if dup is not None else []
+    d_below = filter_targets(ddp, d_below_raw, d_band, "below") if ddp is not None else []
+    w_above = filter_targets(wup, w_above_raw, w_band, "above") if wup is not None else []
+    w_below = filter_targets(wdp, w_below_raw, w_band, "below") if wdp is not None else []
+
+    # ±1× EM daily band for the playbook cue
+    plus1 = prior_close + (em_1d or 0) if prior_close is not None else None
+    minus1 = prior_close - (em_1d or 0) if prior_close is not None else None
 
     # format block
     hdr = f"**{name}** ({ticker}) pre-mkt"
     pre = f"{fmt(pre_last)} ({(pct(pre_last, prior_close) or 0):+.2f}%) · O/N {fmt(o_low)}–{fmt(o_high)}"
     keys = f"H/L {fmt(prior_high)}/{fmt(prior_low)} · Close {fmt(prior_close)} · VWAP~{fmt(prior_vwap)}"
-    atrs = f"ATR14≈{fmt(atr)}  |  WATR14≈{fmt(watr)}"
+    ranges = f"EM(1D)≈{fmt(em_1d)}  |  EM(5D)≈{fmt(em_5d)}  |  ATR14≈{fmt(atr)}  |  WATR14≈{fmt(watr)}"
     d_line = (f"DUP {fmt(dup)} → ▲ {', '.join(fmt(x) for x in d_above) if d_above else '—'}\n"
               f"DDP {fmt(ddp)} → ▼ {', '.join(fmt(x) for x in d_below) if d_below else '—'}")
     w_line = (f"WUP {fmt(wup)} → ▲ {', '.join(fmt(x) for x in w_above) if w_above else '—'}\n"
               f"WDP {fmt(wdp)} → ▼ {', '.join(fmt(x) for x in w_below) if w_below else '—'}")
 
-    plus1, minus1 = (None, None)
-    if atr is not None and prior_close is not None:
-        plus1  = prior_close + atr
-        minus1 = prior_close - atr
-
     fields = [
         {"name": hdr, "value": pre, "inline": False},
         {"name": f"{name} key levels",
-         "value": keys + "\n" + atrs + "\n" + d_line + "\n" + w_line,
+         "value": keys + "\n" + ranges + "\n" + d_line + "\n" + w_line,
          "inline": False},
     ]
-    # return extra data for playbook cues
-    meta = {"prior_close": prior_close, "atr": atr, "bands": (plus1, minus1)}
+    # meta for playbook cues
+    meta = {"prior_close": prior_close, "em1": em_1d, "em5": em_5d, "bands": (plus1, minus1)}
     return fields, meta
 
 # ---------- main ----------
@@ -202,6 +243,7 @@ def main():
     es_daily = es.history(period="90d", interval="1d", auto_adjust=False)
     es_prev_close = float(es_daily.iloc[-2]["Close"]) if len(es_daily)>=2 else float(es_daily.iloc[-1]["Close"])
     atr_points = calc_atr14(es_daily)
+
     vixh = yf.Ticker("^VIX").history(period="2d", interval="1d")
     vix3h = yf.Ticker("^VIX3M").history(period="2d", interval="1d")
     vix  = None if vixh.empty else float(vixh["Close"].iloc[-1])
@@ -220,7 +262,7 @@ def main():
     base_label = label
     if guard: label = label + " (FLAT*)"
 
-    # Build symbol fields + keep meta for cues
+    # Build symbol fields + meta for cues
     fields = []
     spx_meta, nq_meta = None, None
     if "SPX" in symbols_cfg:
@@ -230,15 +272,17 @@ def main():
         nq_blk, nq_meta = build_symbol_block("NQ", symbols_cfg["NQ"], today)
         fields.extend(nq_blk)
 
-    # Vol snapshot
+    # Vol snapshot (show VIX & VXN plus term and IV proxy)
+    vxn_h = yf.Ticker("^VXN").history(period="2d", interval="1d")
+    vxn = None if vxn_h.empty else float(vxn_h["Close"].iloc[-1])
     term_ratio = None if (vix is None or vix==0 or vix3 is None) else vix3/vix
     fields.insert(2, {
         "name":"Vol snapshot",
-        "value": f"VIX {fmt(vix,1)} · 3M/1M {fmt(term_ratio,2)} · IV30~{fmt(iv30,3)} · skew {skew_note}",
+        "value": f"VIX {fmt(vix,1)} · VXN {fmt(vxn,1)} · 3M/1M(SPX) {fmt(term_ratio,2)} · IV30~{fmt(iv30,3)} · skew {skew_note}",
         "inline": False
     })
 
-    # --- Macro Calendar (static lines you requested; replace with file feed later if desired) ---
+    # --- Macro Calendar (static for now) ---
     macro_lines = [
         "No major U.S. economic releases today.",
         "CPI report scheduled Tuesday at 8:30 am ET"
@@ -256,7 +300,7 @@ def main():
             "name": "Playbook Cue – SPX",
             "value": (
                 "Strategy: 0–2 DTE **iron condors / credit spreads** anchored at edges of intraday range\n"
-                f"Entry: fade moves near **±1× ATR** bands (**~{fmt(up1)} / ~{fmt(dn1)}**) after initial 10–30 min\n"
+                f"Entry: fade moves near **±1× EM** bands (**~{fmt(up1)} / ~{fmt(dn1)}**) after initial 10–30 min\n"
                 f"Size Multiplier: **{size_mult:.1f}×** (baseline 0.8× in MR)\n"
                 "Tactical Notes: Avoid breakout chasing unless breadth >60% or term flips to backwardation. "
                 "Favor fades into early reversals / reversion-to-mean."
@@ -264,18 +308,18 @@ def main():
             "inline": False
         })
 
-    # --- Playbook Cue – NQ (futures only: long/short) ---
+    # --- Playbook Cue – NQ (futures) ---
     if nq_meta:
         nqu, nqd = nq_meta["bands"]
         bias_txt = ("Bias: *fade extremes* in MR; "
-                    "in TREND, look to join direction on pullbacks toward VWAP/0.5–0.7× ATR.")
+                    "in TREND, look to join direction on pullbacks toward VWAP/0.5–0.7× EM.")
         fields.append({
             "name": "Playbook Cue – NQ (Futures)",
             "value": (
-                "Strategy: **intraday long/short** using ±1× ATR as action bands\n"
+                "Strategy: **intraday long/short** using ±1× EM as action bands\n"
                 f"Entry: fade toward mean near **~{fmt(nqu)} / ~{fmt(nqd)}** in MR; "
                 "or join trend on controlled pullbacks\n"
-                f"Risk/Target: initial stop ~0.3× ATR; first target ~0.5× ATR\n"
+                f"Risk/Target: initial stop ~0.3× EM; first target ~0.5× EM\n"
                 f"Size Multiplier: **{size_mult:.1f}×**\n" + bias_txt
             ),
             "inline": False
@@ -284,7 +328,7 @@ def main():
     # Regime + Playbook summary (global)
     if "MEAN-REVERT" in base_label:
         play = [
-            "Primary: ranges & fades (use ATR bands)",
+            "Primary: ranges & fades (use EM bands)",
             "Timing: after 10:00 ET; second probe preferred",
             "Avoid: breakout chases unless breadth expands"
         ]
