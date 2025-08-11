@@ -18,4 +18,5 @@ jobs:
       - name: Send brief
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          USE_WIKI_BREADTH: "true"
         run: python brief.py
