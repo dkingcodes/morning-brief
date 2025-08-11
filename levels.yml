@@ -1,0 +1,36 @@
+# levels.yml
+symbols:
+  SPX:
+    ticker: "ES=F"           # or "^GSPC"
+    day_atr_mult: 1.0        # targets must be within ±(mult × ATR14) of the DAILY pivot
+    week_atr_mult: 1.0       # within ±(mult × Weekly ATR14) of the WEEKLY pivot
+    daily:
+      "2025-08-11":          # <-- update each trading day
+        dup: 6402.49         # Daily Upside Pivot
+        ddp: 6379.54         # Daily Downside Pivot
+        above: [6420, 6424.05, 6429.81]   # candidate targets ABOVE DUP
+        below: [6375.23, 6368.30, 6364.12, 6357.23]   # candidate targets BELOW DDP
+        # (optional legacy keys also supported: r1,r2,r3,s1,s2,s3)
+    weekly:
+      "2025-W33":            # <-- update each Monday (ISO week)
+        wup: 6420.00         # Weekly Upside Pivot
+        wdp: 6336.35         # Weekly Downside Pivot
+        above: [6429.81, 6438.56, 6464.57, 6485.32, 6497.03, 6506.61]
+        below: [6329.36, 6312.02, 6302.04, 6289.24, 6272.18, 6259.61]
+
+  NQ:
+    ticker: "NQ=F"           # or "^NDX"
+    day_atr_mult: 1.0
+    week_atr_mult: 1.0
+    daily:
+      "2025-08-11":
+        dup: 23783.50
+        ddp: 23646.75
+        above: [23844.50, 23872.75, 23886]
+        below: [23624.25, 23615, 23583, 23565.50]
+    weekly:
+      "2025-W33":
+        wup: 23844.50
+        wdp: 23505.50 (23646.75/624.25 soft pivot)
+        above: [23872.75, 23886, 23966.50, 24013, 24065.75]
+        below: [23480, 23458.75, 23443.50, 23424.75, 23403.75, 23317.50]
