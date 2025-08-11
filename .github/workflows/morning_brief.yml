@@ -1,22 +1,40 @@
+# .github/workflows/morning_brief.yml
 name: Morning Daily Brief to Discord
 
 on:
   schedule:
-    # 11:30 UTC = 7:30am ET during Daylight Saving (Mar–Nov)
-    - cron: "30 11 * * 1-5"
-  workflow_dispatch: {}  # allows manual "Run workflow" button
+    # 11:30 UTC = 7:30am ET during DST
+    - cron: '30 11 * * 1-5'
+  workflow_dispatch:
 
 jobs:
-  run:
+  send:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: pip install yfinance requests numpy pandas
+          python-version: '3.11'
+
+      # >>> Add THIS step <<<
+      - name: Install deps
+        run: pip install --disable-pip-version-check yfinance requests numpy pandas pyyaml
+
+      - name: Webhook smoke test
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK_URL}" ]; then
+            echo "❌ Secret DISCORD_WEBHOOK_URL is missing"; exit 2
+          fi
+          curl -sS -H "Content-Type: application/json" \
+               -d '{"content":"✅ GitHub Action can reach Discord (smoke test)"}' \
+               "${DISCORD_WEBHOOK_URL}" || { echo "❌ Discord webhook unreachable"; exit 2; }
+
       - name: Send brief
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          USE_WIKI_BREADTH: "true"
         run: python brief.py
