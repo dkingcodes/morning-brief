@@ -11,6 +11,27 @@ import pandas as pd
 import yfinance as yf
 import yaml
 
+def fnum(x):
+    """Robust float coercion: handles strings like '17,650', ' na ', None."""
+    try:
+        if x is None:
+            return None
+        if isinstance(x, str):
+            x = x.strip().replace(",", "")
+            if x == "" or x.lower() in ("na", "none", "null"):
+                return None
+        return float(x)
+    except Exception:
+        return None
+
+def fnum_list(xs):
+    out = []
+    for v in (xs or []):
+        fv = fnum(v)
+        if fv is not None:
+            out.append(fv)
+    return out
+
 ET = ZoneInfo("America/New_York")
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 if not WEBHOOK:
@@ -84,15 +105,24 @@ def filter_targets(pivot, candidates, band, direction):
         return sorted(keep, reverse=True)
 
 def extract_pivots(entry):
-    if not entry: return None
-    dup = entry.get("dup"); ddp = entry.get("ddp")
-    wup = entry.get("wup"); wdp = entry.get("wdp")
-    above = list(entry.get("above", []))
-    below = list(entry.get("below", []))
-    for k in ("r1","r2","r3"):
-        if k in entry and entry[k] is not None: above.append(entry[k])
-    for k in ("s1","s2","s3"):
-        if k in entry and entry[k] is not None: below.append(entry[k])
+    """Supports DUP/DDP/WUP/WDP + legacy r/s keys; coerces everything to floats."""
+    if not entry:
+        return None, None, None, None, [], []
+    dup = fnum(entry.get("dup"))
+    ddp = fnum(entry.get("ddp"))
+    wup = fnum(entry.get("wup"))
+    wdp = fnum(entry.get("wdp"))
+    above = fnum_list(entry.get("above", []))
+    below = fnum_list(entry.get("below", []))
+    # legacy extras
+    for k in ("r1", "r2", "r3"):
+        fv = fnum(entry.get(k))
+        if fv is not None:
+            above.append(fv)
+    for k in ("s1", "s2", "s3"):
+        fv = fnum(entry.get(k))
+        if fv is not None:
+            below.append(fv)
     return dup, ddp, wup, wdp, above, below
 
 # ---------- per-symbol block ----------
