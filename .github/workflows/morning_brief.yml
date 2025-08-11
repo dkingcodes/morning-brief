@@ -1,0 +1,21 @@
+name: Morning Daily Brief to Discord
+
+on:
+  schedule:
+    # 11:30 UTC = 7:30am ET during Daylight Saving (Mar–Nov)
+    - cron: "30 11 * * 1-5"
+  workflow_dispatch: {}  # allows manual "Run workflow" button
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install yfinance requests numpy pandas
+      - name: Send brief
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python brief.py
