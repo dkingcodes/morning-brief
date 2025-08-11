@@ -1,12 +1,10 @@
-# brief.py — v6
+# brief.py — v8
 # Morning Daily Brief to Discord (7:30am ET)
-# - Daily/Weekly bands use options-implied Expected Move (EM) instead of ADR/ATR.
-# - EM(SPX) from VIX; EM(NQ) from VXN. EM(days) = Price * IV_annual * sqrt(days/252).
-# - Daily targets filtered around DUP/DDP with ±(EM_1D * day_atr_mult).
-# - Weekly targets filtered around WUP/WDP with ±(EM_5D * week_atr_mult).
-# - Keeps detailed Regime + Playbook cues, Macro block, SPX/NQ sections.
+# - Uses options-implied Expected Move (EM) internally to FILTER targets (daily=1D, weekly=5D),
+#   but playbook text is LEVEL-DRIVEN (no "fade ±1 EM band" language).
+# - Shows SPX/NQ blocks, Breadth, Macro, Regime, and Playbook cues that name your nearest targets.
 
-import os, math, traceback
+import os, math, traceback, random
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -52,7 +50,7 @@ def fnum_list(xs):
     return out
 
 def calc_atr14(df):
-    """Still compute full-session ATR14 for reference text (not used for bands)."""
+    """Full-session ATR14 (display only, not for filtering)."""
     if df is None or df.empty or len(df) < 15: return None
     h,l,c = df["High"], df["Low"], df["Close"]
     pc = c.shift(1)
@@ -60,7 +58,7 @@ def calc_atr14(df):
     return float(tr.rolling(14).mean().iloc[-1])
 
 def iv30_and_skew_proxy(prior_close):
-    """For the global snapshot (SPX-ish), try SPY options; fallback to VIX."""
+    """Global snapshot (SPX-ish): try SPY options; fallback to VIX."""
     try:
         spy = yf.Ticker("SPY")
         opts = spy.options
@@ -107,12 +105,7 @@ def expected_move(price, iv_annual, days):
     return p * iv * math.sqrt(days / 252.0)
 
 def iv_proxy_for_symbol(name):
-    """
-    IV proxy (annualized) per symbol for EM:
-      SPX -> VIX
-      NQ  -> VXN (fallback to VIX if N/A)
-    Returns float in decimals (e.g., 0.18) or None.
-    """
+    """IV proxy (annualized) per symbol for EM: SPX->VIX, NQ->VXN (fallback VIX)."""
     try:
         if name == "SPX":
             h = yf.Ticker("^VIX").history(period="2d", interval="1d")
@@ -121,7 +114,6 @@ def iv_proxy_for_symbol(name):
             hvxn = yf.Ticker("^VXN").history(period="2d", interval="1d")
             if not hvxn.empty:
                 return float(hvxn["Close"].iloc[-1]) / 100.0
-            # fallback to VIX if VXN missing
             hvix = yf.Ticker("^VIX").history(period="2d", interval="1d")
             return None if hvix.empty else float(hvix["Close"].iloc[-1]) / 100.0
         else:
@@ -161,11 +153,60 @@ def extract_pivots(entry):
         if fv is not None: below.append(fv)
     return dup, ddp, wup, wdp, above, below
 
+def spx_breadth_wiki(sample=120, seed=42):
+    """% of SPX components above 20/50dma from Wikipedia sample."""
+    try:
+        html = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", timeout=20).text
+        try:
+            from bs4 import BeautifulSoup
+        except Exception:
+            return None, None
+        soup = BeautifulSoup(html, "html.parser")
+        table = soup.find("table", {"id":"constituents"})
+        rows = table.find_all("tr")[1:]
+        syms = []
+        for r in rows:
+            tds = r.find_all("td")
+            if not tds: continue
+            s = tds[0].text.strip().replace(".", "-")
+            syms.append(s)
+        if len(syms) < 50: return None, None
+        random.Random(seed).shuffle(syms)
+        subset = syms[:sample]
+        data = yf.download(subset, period="70d", interval="1d", progress=False, group_by="ticker", auto_adjust=False)
+        try:
+            closes = data["Close"]
+        except Exception:
+            try:
+                closes = data.xs("Close", level=-1, axis=1)
+            except Exception:
+                return None, None
+        p20_list, p50_list = [], []
+        for s in subset:
+            try:
+                c = closes[s].dropna()
+                if len(c) >= 50:
+                    ma20 = c.rolling(20).mean().iloc[-1]
+                    ma50 = c.rolling(50).mean().iloc[-1]
+                    p20_list.append(float(c.iloc[-1] > ma20))
+                    p50_list.append(float(c.iloc[-1] > ma50))
+            except Exception:
+                continue
+        p20 = round(100.0 * np.mean(p20_list), 1) if p20_list else None
+        p50 = round(100.0 * np.mean(p50_list), 1) if p50_list else None
+        return p20, p50
+    except Exception:
+        return None, None
+
+def list_head(xs, k=3):
+    xs = xs or []
+    return ", ".join(fmt(v) for v in xs[:k]) if xs else "—"
+
 # ---------- per-symbol block ----------
 def build_symbol_block(name, cfg, today):
     ticker = cfg.get("ticker", "ES=F" if name=="SPX" else "NQ=F")
-    day_mult  = float(cfg.get("day_atr_mult", 1.0))   # now EM multiplier
-    week_mult = float(cfg.get("week_atr_mult", 1.0))  # now EM multiplier
+    day_mult  = float(cfg.get("day_atr_mult", 1.0))   # EM multiplier for filtering
+    week_mult = float(cfg.get("week_atr_mult", 1.0))  # EM multiplier for filtering
 
     t = yf.Ticker(ticker)
     daily = t.history(period="90d", interval="1d", auto_adjust=False)
@@ -178,7 +219,7 @@ def build_symbol_block(name, cfg, today):
     o_low  = float(pm["Low"].min()) if not pm.empty else prior_low
     o_high = float(pm["High"].max()) if not pm.empty else prior_high
 
-    # reference ATRs just for display sanity (not used for bands)
+    # reference ATRs just for display sanity (not used for filtering)
     atr = calc_atr14(daily)
     week = t.history(period="400d", interval="1wk", auto_adjust=False)
     watr = calc_atr14(week)
@@ -197,17 +238,13 @@ def build_symbol_block(name, cfg, today):
     dup, ddp, _, _, d_above_raw, d_below_raw = extract_pivots(d_ent)
     _,   _, wup, wdp, w_above_raw, w_below_raw = extract_pivots(w_ent)
 
-    # filter to EM bands
+    # filter to EM bands (used internally only)
     d_band = (em_1d or 0) * day_mult
     w_band = (em_5d or 0) * week_mult
     d_above = filter_targets(dup, d_above_raw, d_band, "above") if dup is not None else []
     d_below = filter_targets(ddp, d_below_raw, d_band, "below") if ddp is not None else []
     w_above = filter_targets(wup, w_above_raw, w_band, "above") if wup is not None else []
     w_below = filter_targets(wdp, w_below_raw, w_band, "below") if wdp is not None else []
-
-    # ±1× EM daily band for the playbook cue
-    plus1 = prior_close + (em_1d or 0) if prior_close is not None else None
-    minus1 = prior_close - (em_1d or 0) if prior_close is not None else None
 
     # format block
     hdr = f"**{name}** ({ticker}) pre-mkt"
@@ -225,8 +262,14 @@ def build_symbol_block(name, cfg, today):
          "value": keys + "\n" + ranges + "\n" + d_line + "\n" + w_line,
          "inline": False},
     ]
-    # meta for playbook cues
-    meta = {"prior_close": prior_close, "em1": em_1d, "em5": em_5d, "bands": (plus1, minus1)}
+    # meta for playbook cues (include level lists)
+    meta = {
+        "prior_close": prior_close,
+        "em1": em_1d, "em5": em_5d,
+        "dup": dup, "ddp": ddp, "wup": wup, "wdp": wdp,
+        "d_above": d_above, "d_below": d_below,
+        "w_above": w_above, "w_below": w_below
+    }
     return fields, meta
 
 # ---------- main ----------
@@ -272,7 +315,7 @@ def main():
         nq_blk, nq_meta = build_symbol_block("NQ", symbols_cfg["NQ"], today)
         fields.extend(nq_blk)
 
-    # Vol snapshot (show VIX & VXN plus term and IV proxy)
+    # Vol snapshot
     vxn_h = yf.Ticker("^VXN").history(period="2d", interval="1d")
     vxn = None if vxn_h.empty else float(vxn_h["Close"].iloc[-1])
     term_ratio = None if (vix is None or vix==0 or vix3 is None) else vix3/vix
@@ -282,7 +325,16 @@ def main():
         "inline": False
     })
 
-    # --- Macro Calendar (static for now) ---
+    # Breadth (SPX % above 20/50dma)
+    breadth_sample = int(os.getenv("BREADTH_SAMPLE", "120"))
+    p20, p50 = spx_breadth_wiki(sample=breadth_sample, seed=42)
+    fields.append({
+        "name": "Breadth (S&P 500 sample)",
+        "value": f">%20dma {fmt(p20,1)}% · >%50dma {fmt(p50,1)}%  (n≈{breadth_sample})",
+        "inline": False
+    })
+
+    # Macro Calendar (static lines; swap to file/API later if desired)
     macro_lines = [
         "No major U.S. economic releases today.",
         "CPI report scheduled Tuesday at 8:30 am ET"
@@ -293,34 +345,42 @@ def main():
         "inline": False
     })
 
-    # --- Playbook Cue – SPX (options) ---
+    # --- Playbook Cue – SPX (options), level-driven ---
     if spx_meta:
-        up1, dn1 = spx_meta["bands"]
+        dup, ddp = spx_meta["dup"], spx_meta["ddp"]
+        d_up_list  = list_head(spx_meta["d_above"], k=3)
+        d_dn_list  = list_head(spx_meta["d_below"], k=3)
+        w_up_first = list_head(spx_meta["w_above"], k=1)
+        w_dn_first = list_head(spx_meta["w_below"], k=1)
         fields.append({
             "name": "Playbook Cue – SPX",
             "value": (
-                "Strategy: 0–2 DTE **iron condors / credit spreads** anchored at edges of intraday range\n"
-                f"Entry: fade moves near **±1× EM** bands (**~{fmt(up1)} / ~{fmt(dn1)}**) after initial 10–30 min\n"
-                f"Size Multiplier: **{size_mult:.1f}×** (baseline 0.8× in MR)\n"
-                "Tactical Notes: Avoid breakout chasing unless breadth >60% or term flips to backwardation. "
-                "Favor fades into early reversals / reversion-to-mean."
+                "Strategy: 0–2 DTE **iron condors / credit spreads** anchored to your levels\n"
+                f"Entry: fade **tests of nearest daily targets** around DUP/DDP (DUP {fmt(dup)}, DDP {fmt(ddp)}) "
+                f"after the first 10–30 min\n"
+                f"Daily targets → ▲ {d_up_list}  |  ▼ {d_dn_list}\n"
+                f"Stretch (weekly) → ▲ {w_up_first}  |  ▼ {w_dn_first}\n"
+                f"Size Multiplier: **{size_mult:.1f}×** (reduce if guardrails trigger)\n"
+                "Risk: use the next level beyond your entry as invalidation; avoid chasing breakouts unless breadth expands"
             ),
             "inline": False
         })
 
-    # --- Playbook Cue – NQ (futures) ---
+    # --- Playbook Cue – NQ (futures), level-driven ---
     if nq_meta:
-        nqu, nqd = nq_meta["bands"]
-        bias_txt = ("Bias: *fade extremes* in MR; "
-                    "in TREND, look to join direction on pullbacks toward VWAP/0.5–0.7× EM.")
+        dup, ddp = nq_meta["dup"], nq_meta["ddp"]
+        d_up_list  = list_head(nq_meta["d_above"], k=3)
+        d_dn_list  = list_head(nq_meta["d_below"], k=3)
+        w_up_first = list_head(nq_meta["w_above"], k=1)
+        w_dn_first = list_head(nq_meta["w_below"], k=1)
         fields.append({
             "name": "Playbook Cue – NQ (Futures)",
             "value": (
-                "Strategy: **intraday long/short** using ±1× EM as action bands\n"
-                f"Entry: fade toward mean near **~{fmt(nqu)} / ~{fmt(nqd)}** in MR; "
-                "or join trend on controlled pullbacks\n"
-                f"Risk/Target: initial stop ~0.3× EM; first target ~0.5× EM\n"
-                f"Size Multiplier: **{size_mult:.1f}×**\n" + bias_txt
+                "Strategy: **intraday long/short** at your levels\n"
+                f"Long plan: reclaim/hold above **DUP {fmt(dup)}** → work **{d_up_list}**; "
+                f"Short plan: reject/fail below **DDP {fmt(ddp)}** → work **{d_dn_list}**\n"
+                f"Weekly stretch targets → ▲ {w_up_first}  |  ▼ {w_dn_first}\n"
+                f"Risk: initial stop beyond next level; partials at first/second targets • Size: **{size_mult:.1f}×**"
             ),
             "inline": False
         })
@@ -328,18 +388,18 @@ def main():
     # Regime + Playbook summary (global)
     if "MEAN-REVERT" in base_label:
         play = [
-            "Primary: ranges & fades (use EM bands)",
+            "Primary: ranges & fades at levels",
             "Timing: after 10:00 ET; second probe preferred",
             "Avoid: breakout chases unless breadth expands"
         ]
     elif "TREND" in base_label:
         play = [
-            "Primary: directional follow-through; pullback entries",
+            "Primary: directional follow-through; pullback entries to prior level",
             "Cut on regime slip or guardrail triggers",
-            "Avoid: selling ranges unless momentum wanes"
+            "Avoid: range-selling unless momentum wanes"
         ]
     else:
-        play = ["Primary: small / neutral", "Scalps to VWAP", "Avoid: big directional bets"]
+        play = ["Primary: small / neutral", "Scalps to VWAP/levels", "Avoid: big directional bets"]
 
     fields.append({
         "name":"Regime Classifier",
