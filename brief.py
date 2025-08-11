@@ -11,7 +11,13 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-WEBHOOK = os.environ["https://discord.com/api/webhooks/1403202271461904415/govvmwLWM2ddVfCIoooIxFb8bbVNdyjxaTnYlLlnaMy8mvki4pCHU4WdkdrExn57uyvk"]  # set in GitHub Secrets
+import os
+# ...
+WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
+if not WEBHOOK:
+    print("❌ DISCORD_WEBHOOK_URL is missing (GitHub secret not set or not passed).")
+    raise SystemExit(2)
+
 
 ET = ZoneInfo("America/New_York")
 
