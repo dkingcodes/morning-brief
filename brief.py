@@ -1,4 +1,6 @@
-# brief.py — v4 (SPX/NQ + DUP/DDP/WUP/WDP + ATR-filtered targets)
+# brief.py — v5
+# Morning Daily Brief to Discord (7:30am ET)
+# Adds: Macro Calendar block + Playbook Cue (SPX options / NQ futures)
 import os, math, traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -72,7 +74,6 @@ def regime_classifier(prior_close, atr_points, vix, vix3m, px_close):
     return label, size, term, atr_pct, slope_pct_per_day, drivers
 
 def filter_targets(pivot, candidates, band, direction):
-    """Keep only levels within ±band of pivot and on the requested side."""
     if pivot is None or band is None: return []
     x = [v for v in (candidates or []) if v is not None]
     if direction == "above":
@@ -83,13 +84,11 @@ def filter_targets(pivot, candidates, band, direction):
         return sorted(keep, reverse=True)
 
 def extract_pivots(entry):
-    """Supports new schema and legacy r/s keys."""
     if not entry: return None
     dup = entry.get("dup"); ddp = entry.get("ddp")
     wup = entry.get("wup"); wdp = entry.get("wdp")
     above = list(entry.get("above", []))
     below = list(entry.get("below", []))
-    # legacy add-ins
     for k in ("r1","r2","r3"):
         if k in entry and entry[k] is not None: above.append(entry[k])
     for k in ("s1","s2","s3"):
@@ -117,7 +116,6 @@ def build_symbol_block(name, cfg, today):
     week = t.history(period="400d", interval="1wk", auto_adjust=False)
     watr = calc_atr14(week)
 
-    # pivots from YAML
     d_key = today.strftime("%Y-%m-%d")
     w_key = f"{today.isocalendar().year}-W{int(today.isocalendar().week):02d}"
     d_ent = (cfg.get("daily") or {}).get(d_key, {})
@@ -126,7 +124,6 @@ def build_symbol_block(name, cfg, today):
     dup, ddp, _, _, d_above_raw, d_below_raw = extract_pivots(d_ent)
     _,   _, wup, wdp, w_above_raw, w_below_raw = extract_pivots(w_ent)
 
-    # filter to ATR bands
     d_above = filter_targets(dup, d_above_raw, (atr or 0)*day_mult, "above") if dup is not None else []
     d_below = filter_targets(ddp, d_below_raw, (atr or 0)*day_mult, "below") if ddp is not None else []
     w_above = filter_targets(wup, w_above_raw, (watr or 0)*week_mult, "above") if wup is not None else []
@@ -142,12 +139,20 @@ def build_symbol_block(name, cfg, today):
     w_line = (f"WUP {fmt(wup)} → ▲ {', '.join(fmt(x) for x in w_above) if w_above else '—'}\n"
               f"WDP {fmt(wdp)} → ▼ {', '.join(fmt(x) for x in w_below) if w_below else '—'}")
 
-    return [
+    plus1, minus1 = (None, None)
+    if atr is not None and prior_close is not None:
+        plus1  = prior_close + atr
+        minus1 = prior_close - atr
+
+    fields = [
         {"name": hdr, "value": pre, "inline": False},
         {"name": f"{name} key levels",
          "value": keys + "\n" + atrs + "\n" + d_line + "\n" + w_line,
          "inline": False},
-    ], prior_close
+    ]
+    # return extra data for playbook cues
+    meta = {"prior_close": prior_close, "atr": atr, "bands": (plus1, minus1)}
+    return fields, meta
 
 # ---------- main ----------
 def main():
@@ -163,8 +168,10 @@ def main():
     es_daily = es.history(period="90d", interval="1d", auto_adjust=False)
     es_prev_close = float(es_daily.iloc[-2]["Close"]) if len(es_daily)>=2 else float(es_daily.iloc[-1]["Close"])
     atr_points = calc_atr14(es_daily)
-    vix  = float(yf.Ticker("^VIX").history(period="2d")["Close"].iloc[-1]) if not yf.Ticker("^VIX").history(period="2d").empty else None
-    vix3 = float(yf.Ticker("^VIX3M").history(period="2d")["Close"].iloc[-1]) if not yf.Ticker("^VIX3M").history(period="2d").empty else None
+    vixh = yf.Ticker("^VIX").history(period="2d", interval="1d")
+    vix3h = yf.Ticker("^VIX3M").history(period="2d", interval="1d")
+    vix  = None if vixh.empty else float(vixh["Close"].iloc[-1])
+    vix3 = None if vix3h.empty else float(vix3h["Close"].iloc[-1])
     iv30, skew_note = iv30_and_skew_proxy(es_prev_close)
 
     label, size_mult, term, atr_pct, slope_pct_day, drivers = regime_classifier(
@@ -179,14 +186,17 @@ def main():
     base_label = label
     if guard: label = label + " (FLAT*)"
 
-    # Build symbol fields
+    # Build symbol fields + keep meta for cues
     fields = []
-    for sym in ("SPX","NQ"):
-        if sym in symbols_cfg:
-            blk, _ = build_symbol_block(sym, symbols_cfg[sym], today)
-            fields.extend(blk)
+    spx_meta, nq_meta = None, None
+    if "SPX" in symbols_cfg:
+        spx_blk, spx_meta = build_symbol_block("SPX", symbols_cfg["SPX"], today)
+        fields.extend(spx_blk)
+    if "NQ" in symbols_cfg:
+        nq_blk, nq_meta = build_symbol_block("NQ", symbols_cfg["NQ"], today)
+        fields.extend(nq_blk)
 
-    # Insert global vol/regime
+    # Vol snapshot
     term_ratio = None if (vix is None or vix==0 or vix3 is None) else vix3/vix
     fields.insert(2, {
         "name":"Vol snapshot",
@@ -194,27 +204,64 @@ def main():
         "inline": False
     })
 
-    # Regime + Playbook
+    # --- Macro Calendar (static lines you requested; replace with file feed later if desired) ---
+    macro_lines = [
+        "No major U.S. economic releases today.",
+        "CPI report scheduled Tuesday at 8:30 am ET"
+    ]
+    fields.append({
+        "name": "Macro Calendar",
+        "value": "• " + "\n• ".join(macro_lines),
+        "inline": False
+    })
+
+    # --- Playbook Cue – SPX (options) ---
+    if spx_meta:
+        up1, dn1 = spx_meta["bands"]
+        fields.append({
+            "name": "Playbook Cue – SPX",
+            "value": (
+                "Strategy: 0–2 DTE **iron condors / credit spreads** anchored at edges of intraday range\n"
+                f"Entry: fade moves near **±1× ATR** bands (**~{fmt(up1)} / ~{fmt(dn1)}**) after initial 10–30 min\n"
+                f"Size Multiplier: **{size_mult:.1f}×** (baseline 0.8× in MR)\n"
+                "Tactical Notes: Avoid breakout chasing unless breadth >60% or term flips to backwardation. "
+                "Favor fades into early reversals / reversion-to-mean."
+            ),
+            "inline": False
+        })
+
+    # --- Playbook Cue – NQ (futures only: long/short) ---
+    if nq_meta:
+        nqu, nqd = nq_meta["bands"]
+        bias_txt = ("Bias: *fade extremes* in MR; "
+                    "in TREND, look to join direction on pullbacks toward VWAP/0.5–0.7× ATR.")
+        fields.append({
+            "name": "Playbook Cue – NQ (Futures)",
+            "value": (
+                "Strategy: **intraday long/short** using ±1× ATR as action bands\n"
+                f"Entry: fade toward mean near **~{fmt(nqu)} / ~{fmt(nqd)}** in MR; "
+                "or join trend on controlled pullbacks\n"
+                f"Risk/Target: initial stop ~0.3× ATR; first target ~0.5× ATR\n"
+                f"Size Multiplier: **{size_mult:.1f}×**\n" + bias_txt
+            ),
+            "inline": False
+        })
+
+    # Regime + Playbook summary (global)
     if "MEAN-REVERT" in base_label:
         play = [
-            "Primary: 0–2 DTE **iron condors / credit spreads** at ±1.0× ATR bands",
-            "Timing: enter after **10:00 ET** on **second probe**; avoid first impulse",
-            "Size: **0.8×** baseline (1.0× if breadth >60% & term>1)",
-            "Avoid: breakout chases unless breadth expands & rates confirm"
+            "Primary: ranges & fades (use ATR bands)",
+            "Timing: after 10:00 ET; second probe preferred",
+            "Avoid: breakout chases unless breadth expands"
         ]
     elif "TREND" in base_label:
         play = [
-            "Primary: **directional debit verticals / breakouts** with follow-through",
-            "Timing: use pullbacks to 0.5–0.7× ATR; cut on regime slip",
-            "Size: **1.0×** baseline (reduce if guardrails trigger)",
-            "Avoid: range-selling unless term>1 and momentum wanes"
+            "Primary: directional follow-through; pullback entries",
+            "Cut on regime slip or guardrail triggers",
+            "Avoid: selling ranges unless momentum wanes"
         ]
     else:
-        play = [
-            "Primary: **small / delta-neutral**; scalps toward VWAP only",
-            "Size: **0.5×** baseline",
-            "Avoid: strong directional bets; wait for clarity"
-        ]
+        play = ["Primary: small / neutral", "Scalps to VWAP", "Avoid: big directional bets"]
 
     fields.append({
         "name":"Regime Classifier",
