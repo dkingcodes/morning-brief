@@ -23,16 +23,6 @@ jobs:
       - name: Install deps
         run: pip install --disable-pip-version-check yfinance requests numpy pandas pyyaml
 
-      - name: Webhook smoke test
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          if [ -z "${DISCORD_WEBHOOK_URL}" ]; then
-            echo "❌ Secret DISCORD_WEBHOOK_URL is missing"; exit 2
-          fi
-          curl -sS -H "Content-Type: application/json" \
-               -d '{"content":"✅ GitHub Action can reach Discord (smoke test)"}' \
-               "${DISCORD_WEBHOOK_URL}" || { echo "❌ Discord webhook unreachable"; exit 2; }
 
       - name: Send brief
         env:
