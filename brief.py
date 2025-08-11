@@ -131,7 +131,7 @@ def main():
     minus1_5 = prior_close - 1.5 * (atr_points or 0.0)
 
     # Build embed
-    color = 0x00A67E if "TREND" in label else (0xEAB308 if "MEAN" in label else 0x6B7280)
+    color = 0x8C52FF  # Xenith purple
     fields = [
         {"name":"SPY pre-market",
          "value": f"{fmt(pre_last)} ({(pct(pre_last, prior_close) or 0):+.2f}%) · O/N {fmt(ovr_low)}–{fmt(ovr_high)}",
@@ -157,7 +157,7 @@ def main():
             "title": f"Morning Daily Brief — {now_et.strftime('%a, %b %d, %Y')} · 7:30am ET",
             "color": color,
             "fields": fields,
-            "footer": {"text": "Automated brief • data via yfinance"}
+            "footer": {"text": "Xenith Trading • Automated Daily Brief"}
         }]
     }
     requests.post(WEBHOOK, json=payload, timeout=30).raise_for_status()
