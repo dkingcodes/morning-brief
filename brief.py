@@ -157,7 +157,7 @@ def main():
             "title": f"Morning Daily Brief — {now_et.strftime('%a, %b %d, %Y')} · 7:30am ET",
             "color": color,
             "fields": fields,
-            "footer": {"text": "Xenith Trading • Automated Daily Brief"}
+            "footer": {"text": "Xenith Trading • Automated Daily Brief", "icon_url": "https://cdn.discordapp.com/attachments/1403340558457508000/1403340645371875328/XENITH_LOGO_FINAL_SYMBOL_BLACK.png?ex=689b26d2&is=6899d552&hm=f976538af94c070940309445248b2a0351c831499b327f6f7e74343e0084b4e1&"}
         }]
     }
     requests.post(WEBHOOK, json=payload, timeout=30).raise_for_status()
